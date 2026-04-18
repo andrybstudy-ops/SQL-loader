@@ -1,0 +1,12 @@
+*.exe
+*.dll
+*.log
+*.o
+*.obj
+*.pdb
+*.ilk
+build/
+cmake-build-*/
+.vs/
+.vscode/
+тест рус путь/
