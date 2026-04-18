@@ -406,9 +406,11 @@ static TableData readXlsx(const fs::path& path) {
     fs::path temp = fs::temp_directory_path() / ("sql_loader_xlsx_" + std::to_string(GetCurrentProcessId()));
     if (fs::exists(temp)) fs::remove_all(temp);
     fs::create_directories(temp);
+    fs::path zipCopy = temp / "workbook.zip";
+    fs::copy_file(path, zipCopy, fs::copy_options::overwrite_existing);
 
     std::wstring command = L"powershell -NoProfile -ExecutionPolicy Bypass -Command "
-        L"\"Expand-Archive -LiteralPath " + shellQuoteW(path.wstring()) +
+        L"\"Expand-Archive -LiteralPath " + shellQuoteW(zipCopy.wstring()) +
         L" -DestinationPath " + shellQuoteW(temp.wstring()) + L" -Force\"";
     int code = _wsystem(command.c_str());
     if (code != 0) {
