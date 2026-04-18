@@ -593,11 +593,12 @@ public:
         SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &env_);
         SQLSetEnvAttr(env_, SQL_ATTR_ODBC_VERSION, reinterpret_cast<void*>(SQL_OV_ODBC3), 0);
         SQLAllocHandle(SQL_HANDLE_DBC, env_, &dbc_);
-        SQLCHAR out[2048];
+        std::wstring connstrW = utf8ToWide(connstr);
+        SQLWCHAR out[2048];
         SQLSMALLINT outLen = 0;
-        SQLRETURN ret = SQLDriverConnectA(
+        SQLRETURN ret = SQLDriverConnectW(
             dbc_, nullptr,
-            reinterpret_cast<SQLCHAR*>(const_cast<char*>(connstr.c_str())),
+            reinterpret_cast<SQLWCHAR*>(connstrW.data()),
             SQL_NTS, out, sizeof(out), &outLen, SQL_DRIVER_NOPROMPT);
         if (!SQL_SUCCEEDED(ret)) {
             throw std::runtime_error("Не удалось подключиться через ODBC: " + diagnostics(SQL_HANDLE_DBC, dbc_));
@@ -615,7 +616,8 @@ public:
     void exec(const std::string& sql) {
         SQLHSTMT stmt = nullptr;
         SQLAllocHandle(SQL_HANDLE_STMT, dbc_, &stmt);
-        SQLRETURN ret = SQLExecDirectA(stmt, reinterpret_cast<SQLCHAR*>(const_cast<char*>(sql.c_str())), SQL_NTS);
+        std::wstring sqlW = utf8ToWide(sql);
+        SQLRETURN ret = SQLExecDirectW(stmt, reinterpret_cast<SQLWCHAR*>(sqlW.data()), SQL_NTS);
         if (!SQL_SUCCEEDED(ret)) {
             std::string err = diagnostics(SQL_HANDLE_STMT, stmt);
             SQLFreeHandle(SQL_HANDLE_STMT, stmt);
@@ -626,18 +628,18 @@ public:
 
 private:
     static std::string diagnostics(SQLSMALLINT type, SQLHANDLE handle) {
-        std::ostringstream ss;
-        SQLCHAR state[6];
-        SQLCHAR text[1024];
+        std::wostringstream ss;
+        SQLWCHAR state[6];
+        SQLWCHAR text[1024];
         SQLINTEGER nativeError = 0;
         SQLSMALLINT textLen = 0;
         for (SQLSMALLINT i = 1; ; ++i) {
-            SQLRETURN ret = SQLGetDiagRecA(type, handle, i, state, &nativeError, text, sizeof(text), &textLen);
+            SQLRETURN ret = SQLGetDiagRecW(type, handle, i, state, &nativeError, text, sizeof(text) / sizeof(SQLWCHAR), &textLen);
             if (!SQL_SUCCEEDED(ret)) break;
-            if (i > 1) ss << " | ";
-            ss << state << ": " << text;
+            if (i > 1) ss << L" | ";
+            ss << reinterpret_cast<wchar_t*>(state) << L": " << reinterpret_cast<wchar_t*>(text);
         }
-        std::string result = ss.str();
+        std::string result = wideToUtf8(ss.str());
         return result.empty() ? "диагностика ODBC недоступна" : result;
     }
 
