@@ -1,9 +1,11 @@
 #include <windows.h>
 #include <shellapi.h>
+#include <commdlg.h>
 #include <sqlext.h>
 
 #include <algorithm>
 #include <cctype>
+#include <cwctype>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
@@ -84,6 +86,12 @@ struct TableData {
     std::vector<std::vector<std::string>> rows;
 };
 
+struct NamedTable {
+    std::string sourceName;
+    std::string tableName;
+    TableData data;
+};
+
 enum class DataType { Integer, Real, Boolean, Date, Timestamp, Text };
 
 static std::ofstream g_log;
@@ -147,6 +155,25 @@ static bool promptYesNo(const std::string& label, bool defaultValue) {
     }
 }
 
+static std::string chooseInputFileDialog() {
+    std::vector<wchar_t> fileName(32768, L'\0');
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = nullptr;
+    ofn.lpstrFilter =
+        L"CSV и Excel (*.csv;*.xlsx)\0*.csv;*.xlsx\0"
+        L"CSV (*.csv)\0*.csv\0"
+        L"Excel (*.xlsx)\0*.xlsx\0"
+        L"Все файлы (*.*)\0*.*\0";
+    ofn.lpstrFile = fileName.data();
+    ofn.nMaxFile = static_cast<DWORD>(fileName.size());
+    ofn.lpstrTitle = L"Выберите CSV или XLSX файл для загрузки";
+    ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+
+    if (!GetOpenFileNameW(&ofn)) return {};
+    return wideToUtf8(fileName.data());
+}
+
 static std::string shellQuote(const std::string& s) {
     std::string out = "'";
     for (char c : s) {
@@ -168,24 +195,42 @@ static std::wstring shellQuoteW(const std::wstring& s) {
 }
 
 static std::string sanitizeIdentifier(const std::string& raw, const std::string& fallback) {
-    std::string s = trim(raw);
-    if (s.empty()) s = fallback;
-    std::string out;
+    std::wstring s = utf8ToWide(trim(raw));
+    if (s.empty()) s = utf8ToWide(fallback);
+    std::wstring out;
     bool lastUnderscore = false;
-    for (unsigned char c : s) {
-        if (std::isalnum(c)) {
-            out += static_cast<char>(std::tolower(c));
+    for (wchar_t c : s) {
+        bool asciiAlnum = (c >= L'0' && c <= L'9') || (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z');
+        bool cyrillic = c >= 0x0400 && c <= 0x04FF;
+        if (asciiAlnum || cyrillic) {
+            out += static_cast<wchar_t>(std::towlower(c));
             lastUnderscore = false;
         } else if (!lastUnderscore) {
-            out += '_';
+            out += L'_';
             lastUnderscore = true;
         }
     }
-    while (!out.empty() && out.front() == '_') out.erase(out.begin());
-    while (!out.empty() && out.back() == '_') out.pop_back();
-    if (out.empty()) out = fallback;
-    if (std::isdigit(static_cast<unsigned char>(out.front()))) out = "c_" + out;
-    return out;
+    while (!out.empty() && out.front() == L'_') out.erase(out.begin());
+    while (!out.empty() && out.back() == L'_') out.pop_back();
+    if (out.empty()) out = utf8ToWide(fallback);
+    if (!out.empty() && out.front() >= L'0' && out.front() <= L'9') out = L"c_" + out;
+    return wideToUtf8(out);
+}
+
+static std::vector<std::string> uniqueTableNames(const std::vector<std::string>& rawNames) {
+    std::vector<std::string> result;
+    std::map<std::string, int> seen;
+    for (size_t i = 0; i < rawNames.size(); ++i) {
+        std::string base = sanitizeIdentifier(rawNames[i], "table_" + std::to_string(i + 1));
+        std::string name = base;
+        int suffix = 2;
+        while (seen[name] > 0) {
+            name = base + "_" + std::to_string(suffix++);
+        }
+        seen[name]++;
+        result.push_back(name);
+    }
+    return result;
 }
 
 static std::vector<std::string> normalizeColumns(const std::vector<std::string>& raw) {
@@ -374,6 +419,13 @@ static std::string xmlDecode(std::string s) {
     return s;
 }
 
+static std::string xmlAttr(const std::string& attrs, const std::string& name) {
+    std::regex re(name + "=\"([^\"]*)\"", std::regex::icase);
+    std::smatch m;
+    if (std::regex_search(attrs, m, re)) return xmlDecode(m[1].str());
+    return {};
+}
+
 static int excelColumnIndex(const std::string& cellRef) {
     int n = 0;
     for (char c : cellRef) {
@@ -402,7 +454,121 @@ static std::vector<std::string> readSharedStrings(const fs::path& root) {
     return strings;
 }
 
-static TableData readXlsx(const fs::path& path) {
+struct XlsxSheetInfo {
+    std::string name;
+    std::string relId;
+    fs::path path;
+};
+
+static TableData parseXlsxSheet(const fs::path& sheetPath, const std::vector<std::string>& shared) {
+    std::string xml = readFile(sheetPath);
+    std::vector<std::vector<std::string>> rawRows;
+    std::regex rowRe("<row[^>]*>([\\s\\S]*?)</row>", std::regex::icase);
+    std::regex cellRe("<c\\s+([^>]*)>([\\s\\S]*?)</c>", std::regex::icase);
+    std::regex refRe("r=\"([A-Z]+[0-9]+)\"", std::regex::icase);
+    std::regex valueRe("<v[^>]*>([\\s\\S]*?)</v>", std::regex::icase);
+    std::regex inlineRe("<t[^>]*>([\\s\\S]*?)</t>", std::regex::icase);
+
+    auto rowsBegin = std::sregex_iterator(xml.begin(), xml.end(), rowRe);
+    auto rowsEnd = std::sregex_iterator();
+    for (auto rit = rowsBegin; rit != rowsEnd; ++rit) {
+        std::string rowXml = (*rit)[1].str();
+        std::vector<std::string> row;
+        auto cellsBegin = std::sregex_iterator(rowXml.begin(), rowXml.end(), cellRe);
+        for (auto cit = cellsBegin; cit != rowsEnd; ++cit) {
+            std::string attrs = (*cit)[1].str();
+            std::string body = (*cit)[2].str();
+            std::smatch m;
+            int index = static_cast<int>(row.size());
+            if (std::regex_search(attrs, m, refRe)) index = excelColumnIndex(m[1].str());
+            if (index < 0) continue;
+            if (static_cast<int>(row.size()) <= index) row.resize(static_cast<size_t>(index + 1));
+
+            std::string type = xmlAttr(attrs, "t");
+            std::string value;
+            if (type == "inlineStr") {
+                if (std::regex_search(body, m, inlineRe)) value = xmlDecode(m[1].str());
+            } else if (std::regex_search(body, m, valueRe)) {
+                value = xmlDecode(m[1].str());
+                if (type == "s") {
+                    int si = std::atoi(value.c_str());
+                    if (si >= 0 && static_cast<size_t>(si) < shared.size()) value = shared[static_cast<size_t>(si)];
+                }
+            }
+            row[static_cast<size_t>(index)] = value;
+        }
+        bool any = false;
+        for (const auto& v : row) {
+            if (!trim(v).empty()) {
+                any = true;
+                break;
+            }
+        }
+        if (any) rawRows.push_back(row);
+    }
+
+    if (rawRows.empty()) return {};
+    TableData data;
+    data.columns = normalizeColumns(rawRows.front());
+    for (size_t i = 1; i < rawRows.size(); ++i) {
+        rawRows[i].resize(data.columns.size());
+        data.rows.push_back(rawRows[i]);
+    }
+    return data;
+}
+
+static fs::path resolveXlsxTarget(const fs::path& root, const std::string& target) {
+    std::string t = target;
+    std::replace(t.begin(), t.end(), '\\', '/');
+    if (!t.empty() && t.front() == '/') {
+        t.erase(t.begin());
+        return root / makePath(t);
+    }
+    if (t.rfind("xl/", 0) == 0) return root / makePath(t);
+    return root / "xl" / makePath(t);
+}
+
+static std::vector<XlsxSheetInfo> readXlsxSheetInfos(const fs::path& root) {
+    fs::path workbook = root / "xl" / "workbook.xml";
+    fs::path relsFile = root / "xl" / "_rels" / "workbook.xml.rels";
+    if (!fs::exists(workbook)) throw std::runtime_error("В XLSX не найден xl/workbook.xml");
+    if (!fs::exists(relsFile)) throw std::runtime_error("В XLSX не найден xl/_rels/workbook.xml.rels");
+
+    std::string workbookXml = readFile(workbook);
+    std::string relsXml = readFile(relsFile);
+
+    std::map<std::string, fs::path> relTargets;
+    std::regex relRe("<Relationship\\s+([^>]*)/?\\s*>", std::regex::icase);
+    auto relBegin = std::sregex_iterator(relsXml.begin(), relsXml.end(), relRe);
+    auto relEnd = std::sregex_iterator();
+    for (auto it = relBegin; it != relEnd; ++it) {
+        std::string attrs = (*it)[1].str();
+        std::string id = xmlAttr(attrs, "Id");
+        std::string target = xmlAttr(attrs, "Target");
+        if (!id.empty() && !target.empty()) relTargets[id] = resolveXlsxTarget(root, target);
+    }
+
+    std::vector<XlsxSheetInfo> sheets;
+    std::regex sheetRe("<sheet\\s+([^>]*)/?\\s*>", std::regex::icase);
+    auto sheetBegin = std::sregex_iterator(workbookXml.begin(), workbookXml.end(), sheetRe);
+    auto sheetEnd = std::sregex_iterator();
+    for (auto it = sheetBegin; it != sheetEnd; ++it) {
+        std::string attrs = (*it)[1].str();
+        XlsxSheetInfo info;
+        info.name = xmlAttr(attrs, "name");
+        info.relId = xmlAttr(attrs, "r:id");
+        auto found = relTargets.find(info.relId);
+        if (!info.name.empty() && found != relTargets.end() && fs::exists(found->second)) {
+            info.path = found->second;
+            sheets.push_back(info);
+        }
+    }
+
+    if (sheets.empty()) throw std::runtime_error("В XLSX не найдено ни одного листа с данными");
+    return sheets;
+}
+
+static std::vector<NamedTable> readXlsxTables(const fs::path& path) {
     fs::path temp = fs::temp_directory_path() / ("sql_loader_xlsx_" + std::to_string(GetCurrentProcessId()));
     if (fs::exists(temp)) fs::remove_all(temp);
     fs::create_directories(temp);
@@ -420,66 +586,23 @@ static TableData readXlsx(const fs::path& path) {
 
     try {
         std::vector<std::string> shared = readSharedStrings(temp);
-        fs::path sheet = temp / "xl" / "worksheets" / "sheet1.xml";
-        if (!fs::exists(sheet)) throw std::runtime_error("В XLSX не найден первый лист sheet1.xml");
-        std::string xml = readFile(sheet);
+        auto sheets = readXlsxSheetInfos(temp);
+        std::vector<std::string> rawNames;
+        for (const auto& sheet : sheets) rawNames.push_back(sheet.name);
+        auto tableNames = uniqueTableNames(rawNames);
 
-        std::vector<std::vector<std::string>> rawRows;
-        std::regex rowRe("<row[^>]*>([\\s\\S]*?)</row>", std::regex::icase);
-        std::regex cellRe("<c\\s+([^>]*)>([\\s\\S]*?)</c>", std::regex::icase);
-        std::regex refRe("r=\"([A-Z]+[0-9]+)\"", std::regex::icase);
-        std::regex typeRe("t=\"([^\"]+)\"", std::regex::icase);
-        std::regex valueRe("<v[^>]*>([\\s\\S]*?)</v>", std::regex::icase);
-        std::regex inlineRe("<t[^>]*>([\\s\\S]*?)</t>", std::regex::icase);
-
-        auto rowsBegin = std::sregex_iterator(xml.begin(), xml.end(), rowRe);
-        auto rowsEnd = std::sregex_iterator();
-        for (auto rit = rowsBegin; rit != rowsEnd; ++rit) {
-            std::string rowXml = (*rit)[1].str();
-            std::vector<std::string> row;
-            auto cellsBegin = std::sregex_iterator(rowXml.begin(), rowXml.end(), cellRe);
-            for (auto cit = cellsBegin; cit != rowsEnd; ++cit) {
-                std::string attrs = (*cit)[1].str();
-                std::string body = (*cit)[2].str();
-                std::smatch m;
-                int index = static_cast<int>(row.size());
-                if (std::regex_search(attrs, m, refRe)) index = excelColumnIndex(m[1].str());
-                if (index < 0) continue;
-                if (static_cast<int>(row.size()) <= index) row.resize(static_cast<size_t>(index + 1));
-
-                std::string type;
-                if (std::regex_search(attrs, m, typeRe)) type = m[1].str();
-                std::string value;
-                if (type == "inlineStr") {
-                    if (std::regex_search(body, m, inlineRe)) value = xmlDecode(m[1].str());
-                } else if (std::regex_search(body, m, valueRe)) {
-                    value = xmlDecode(m[1].str());
-                    if (type == "s") {
-                        int si = std::atoi(value.c_str());
-                        if (si >= 0 && static_cast<size_t>(si) < shared.size()) value = shared[static_cast<size_t>(si)];
-                    }
-                }
-                row[static_cast<size_t>(index)] = value;
+        std::vector<NamedTable> tables;
+        for (size_t i = 0; i < sheets.size(); ++i) {
+            TableData data = parseXlsxSheet(sheets[i].path, shared);
+            if (data.columns.empty()) {
+                logLine("ИНФО", "Лист '" + sheets[i].name + "' пустой, пропускаю");
+                continue;
             }
-            bool any = false;
-            for (const auto& v : row) {
-                if (!trim(v).empty()) {
-                    any = true;
-                    break;
-                }
-            }
-            if (any) rawRows.push_back(row);
+            tables.push_back({sheets[i].name, tableNames[i], data});
         }
-
-        if (rawRows.empty()) throw std::runtime_error("Первый лист XLSX пустой");
-        TableData data;
-        data.columns = normalizeColumns(rawRows.front());
-        for (size_t i = 1; i < rawRows.size(); ++i) {
-            rawRows[i].resize(data.columns.size());
-            data.rows.push_back(rawRows[i]);
-        }
+        if (tables.empty()) throw std::runtime_error("В XLSX нет листов с непустыми данными");
         fs::remove_all(temp);
-        return data;
+        return tables;
     } catch (...) {
         fs::remove_all(temp);
         throw;
@@ -560,9 +683,17 @@ static std::string typeName(DataType t, const std::string& db) {
 }
 
 static std::string quoteIdent(const std::string& id, const std::string& db) {
-    if (db == "mysql") return "`" + id + "`";
-    if (db == "sqlserver") return "[" + id + "]";
-    return "\"" + id + "\"";
+    std::string escaped = id;
+    if (db == "mysql") {
+        replaceAll(escaped, "`", "``");
+        return "`" + escaped + "`";
+    }
+    if (db == "sqlserver") {
+        replaceAll(escaped, "]", "]]");
+        return "[" + escaped + "]";
+    }
+    replaceAll(escaped, "\"", "\"\"");
+    return "\"" + escaped + "\"";
 }
 
 static std::string sqlLiteral(const std::string& value, DataType type) {
@@ -710,26 +841,7 @@ static Options interactiveOptions() {
     std::cout << "Загрузчик SQL - интерфейс в терминале\n";
     std::cout << "Поддерживаемые файлы: .csv и .xlsx\n\n";
 
-    while (true) {
-        opt.input = prompt("Путь к CSV/XLSX файлу");
-        if (opt.input.empty()) {
-            std::cout << "Нужно указать путь к файлу.\n";
-            continue;
-        }
-        if (!fs::exists(makePath(opt.input))) {
-            std::cout << "Файл не найден: " << opt.input << "\n";
-            continue;
-        }
-        if (!endsWithLower(opt.input, ".csv") && !endsWithLower(opt.input, ".xlsx")) {
-            std::cout << "Неподдерживаемый файл. Используйте .csv или .xlsx.\n";
-            continue;
-        }
-        break;
-    }
-
-    std::string defaultTable = sanitizeIdentifier(pathToUtf8(makePath(opt.input).stem()), "imported_data");
-    opt.table = sanitizeIdentifier(prompt("Имя таблицы", defaultTable), defaultTable);
-
+    std::cout << "Сначала укажите данные SQL-сервера.\n";
     std::cout << "\nТип базы данных:\n";
     std::cout << "  1 - PostgreSQL\n";
     std::cout << "  2 - MySQL\n";
@@ -765,6 +877,32 @@ static Options interactiveOptions() {
             opt.user = prompt("Пользователь", "sa");
             opt.password = prompt("Пароль");
         }
+    }
+
+    std::cout << "\nТеперь выберите файл в окне Проводника.\n";
+    while (true) {
+        opt.input = chooseInputFileDialog();
+        if (opt.input.empty()) {
+            opt.input = prompt("Файл не выбран. Вставьте путь к CSV/XLSX файлу вручную или нажмите Enter для повторного выбора");
+            if (opt.input.empty()) continue;
+        }
+        if (!fs::exists(makePath(opt.input))) {
+            std::cout << "Файл не найден: " << opt.input << "\n";
+            continue;
+        }
+        if (!endsWithLower(opt.input, ".csv") && !endsWithLower(opt.input, ".xlsx")) {
+            std::cout << "Неподдерживаемый файл. Используйте .csv или .xlsx.\n";
+            continue;
+        }
+        break;
+    }
+
+    if (endsWithLower(opt.input, ".csv")) {
+        std::string defaultTable = sanitizeIdentifier(pathToUtf8(makePath(opt.input).stem()), "imported_data");
+        opt.table = sanitizeIdentifier(prompt("Имя таблицы", defaultTable), defaultTable);
+    } else {
+        std::cout << "Для XLSX каждый лист будет загружен в отдельную SQL-таблицу.\n";
+        std::cout << "Названия таблиц будут взяты из названий листов Excel.\n";
     }
 
     std::cout << "\nПеред записью в SQL можно выполнить безопасную проверку.\n";
@@ -819,26 +957,35 @@ int main() {
         g_log.open("sql_loader.log", std::ios::app);
         Options opt = parseArgs(commandLineArgsUtf8());
         logLine("ИНФО", "Файл: " + opt.input);
-        logLine("ИНФО", "Целевая СУБД: " + opt.db + ", база: " + opt.dbname + ", таблица: " + opt.table);
+        logLine("ИНФО", "Целевая СУБД: " + opt.db + ", база: " + opt.dbname);
 
-        TableData data;
         fs::path inputPath = makePath(opt.input);
-        if (endsWithLower(opt.input, ".csv")) data = readCsv(inputPath);
-        else if (endsWithLower(opt.input, ".xlsx")) data = readXlsx(inputPath);
-        else throw std::runtime_error("Неподдерживаемый формат файла. Используйте .csv или .xlsx");
-
-        if (data.columns.empty()) throw std::runtime_error("Не найдено ни одного столбца");
-        auto types = inferTypes(data);
-        logLine("ИНФО", "Найдено столбцов: " + std::to_string(data.columns.size()));
-        logLine("ИНФО", "Найдено строк: " + std::to_string(data.rows.size()));
-        for (size_t i = 0; i < data.columns.size(); ++i) {
-            logLine("ИНФО", "Столбец " + std::to_string(i + 1) + ": " + data.columns[i] + " -> " + typeName(types[i], opt.db));
+        std::vector<NamedTable> tables;
+        if (endsWithLower(opt.input, ".csv")) {
+            TableData data = readCsv(inputPath);
+            if (data.columns.empty()) throw std::runtime_error("Не найдено ни одного столбца");
+            tables.push_back({pathToUtf8(inputPath.filename()), opt.table, data});
+        } else if (endsWithLower(opt.input, ".xlsx")) {
+            tables = readXlsxTables(inputPath);
+        } else {
+            throw std::runtime_error("Неподдерживаемый формат файла. Используйте .csv или .xlsx");
         }
 
         if (opt.dryRun) {
             logLine("ИНФО", "Режим проверки. Предпросмотр SQL:");
-            logLine("SQL", createTableSql(opt, data, types));
-            if (!data.rows.empty()) logLine("SQL", insertSql(opt, data, types, data.rows.front()));
+            for (const auto& table : tables) {
+                Options tableOpt = opt;
+                tableOpt.table = table.tableName;
+                auto types = inferTypes(table.data);
+                logLine("ИНФО", "Источник: " + table.sourceName + " -> таблица: " + table.tableName);
+                logLine("ИНФО", "Найдено столбцов: " + std::to_string(table.data.columns.size()));
+                logLine("ИНФО", "Найдено строк: " + std::to_string(table.data.rows.size()));
+                for (size_t i = 0; i < table.data.columns.size(); ++i) {
+                    logLine("ИНФО", "Столбец " + std::to_string(i + 1) + ": " + table.data.columns[i] + " -> " + typeName(types[i], opt.db));
+                }
+                logLine("SQL", createTableSql(tableOpt, table.data, types));
+                if (!table.data.rows.empty()) logLine("SQL", insertSql(tableOpt, table.data, types, table.data.rows.front()));
+            }
             logLine("ИНФО", "Итог: файл успешно прочитан, база данных не изменялась");
             return 0;
         }
@@ -846,26 +993,45 @@ int main() {
         OdbcConnection db(buildConnStr(opt));
         logLine("ИНФО", "Подключение через ODBC выполнено");
 
-        if (opt.dropExisting) {
-            db.exec("DROP TABLE IF EXISTS " + quoteIdent(opt.table, opt.db));
-            logLine("ИНФО", "Существующая таблица с таким именем удалена, если она была");
-        }
-        db.exec(createTableSql(opt, data, types));
-        logLine("ИНФО", "Таблица создана");
+        size_t totalOk = 0;
+        size_t totalRows = 0;
+        for (const auto& table : tables) {
+            Options tableOpt = opt;
+            tableOpt.table = table.tableName;
+            auto types = inferTypes(table.data);
+            totalRows += table.data.rows.size();
 
-        size_t ok = 0;
-        for (size_t i = 0; i < data.rows.size(); ++i) {
-            try {
-                db.exec(insertSql(opt, data, types, data.rows[i]));
-                ok++;
-                if (ok % 100 == 0) logLine("ИНФО", "Загружено строк: " + std::to_string(ok));
-            } catch (const std::exception& e) {
-                logLine("ОШИБКА", "Строка " + std::to_string(i + 2) + " пропущена: " + e.what());
+            logLine("ИНФО", "Источник: " + table.sourceName + " -> таблица: " + table.tableName);
+            logLine("ИНФО", "Найдено столбцов: " + std::to_string(table.data.columns.size()));
+            logLine("ИНФО", "Найдено строк: " + std::to_string(table.data.rows.size()));
+            for (size_t i = 0; i < table.data.columns.size(); ++i) {
+                logLine("ИНФО", "Столбец " + std::to_string(i + 1) + ": " + table.data.columns[i] + " -> " + typeName(types[i], opt.db));
             }
+
+            if (opt.dropExisting) {
+                db.exec("DROP TABLE IF EXISTS " + quoteIdent(tableOpt.table, opt.db));
+                logLine("ИНФО", "Таблица '" + tableOpt.table + "' удалена, если она была");
+            }
+            db.exec(createTableSql(tableOpt, table.data, types));
+            logLine("ИНФО", "Таблица '" + tableOpt.table + "' создана");
+
+            size_t ok = 0;
+            for (size_t i = 0; i < table.data.rows.size(); ++i) {
+                try {
+                    db.exec(insertSql(tableOpt, table.data, types, table.data.rows[i]));
+                    ok++;
+                    totalOk++;
+                    if (ok % 100 == 0) logLine("ИНФО", "Таблица '" + tableOpt.table + "': загружено строк: " + std::to_string(ok));
+                } catch (const std::exception& e) {
+                    logLine("ОШИБКА", "Таблица '" + tableOpt.table + "', строка " + std::to_string(i + 2) + " пропущена: " + e.what());
+                }
+            }
+            logLine("ИНФО", "Таблица '" + tableOpt.table + "': загружено строк: " + std::to_string(ok) + "/" + std::to_string(table.data.rows.size()));
         }
 
-        logLine("ИНФО", "Готово. Загружено строк: " + std::to_string(ok) + "/" + std::to_string(data.rows.size()));
-        logLine("ИНФО", "Итог: файл '" + opt.input + "' загружен в таблицу '" + opt.table + "'");
+        logLine("ИНФО", "Готово. Загружено таблиц: " + std::to_string(tables.size()));
+        logLine("ИНФО", "Готово. Загружено строк: " + std::to_string(totalOk) + "/" + std::to_string(totalRows));
+        logLine("ИНФО", "Итог: файл '" + opt.input + "' загружен в SQL");
         return 0;
     } catch (const std::exception& e) {
         logLine("ОШИБКА", e.what());

@@ -5,7 +5,7 @@
 ## Что умеет
 
 - читает `.csv`;
-- читает первый лист из `.xlsx`;
+- читает все листы из `.xlsx`;
 - поддерживает пути с русскими буквами;
 - определяет количество строк и столбцов;
 - нормализует названия колонок для SQL;
@@ -14,19 +14,20 @@
 - загружает строки;
 - пишет лог в консоль и в `sql_loader.log`;
 - работает с PostgreSQL, MySQL, SQL Server и произвольной ODBC-строкой.
+- в интерактивном режиме сначала спрашивает параметры SQL-сервера, затем открывает окно выбора файла Windows.
 
 ## Сборка
 
 Если `g++` виден в терминале:
 
 ```powershell
-g++ main.cpp -std=c++20 -static-libgcc -static-libstdc++ -lodbc32 -o sql_loader.exe
+g++ main.cpp -std=c++20 -static-libgcc -static-libstdc++ -lodbc32 -lcomdlg32 -o sql_loader.exe
 ```
 
 Если `g++` не виден, можно собрать полным путем:
 
 ```powershell
-& 'C:\Users\krepo\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin\g++.exe' main.cpp -std=c++20 -static-libgcc -static-libstdc++ -lodbc32 -o sql_loader.exe
+& 'C:\Users\krepo\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin\g++.exe' main.cpp -std=c++20 -static-libgcc -static-libstdc++ -lodbc32 -lcomdlg32 -o sql_loader.exe
 ```
 
 Если рядом с `exe` нужна DLL:
@@ -43,11 +44,13 @@ Copy-Item 'C:\Users\krepo\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.
 
 Программа сама спросит:
 
-- путь к `.csv` или `.xlsx`;
-- имя таблицы;
 - тип базы данных;
 - параметры подключения;
+- путь к `.csv` или `.xlsx` через окно выбора файла Windows;
+- имя таблицы для CSV;
 - выполнить только проверку или сразу загрузить данные.
+
+Для XLSX отдельное имя таблицы не спрашивается: каждый лист Excel загружается в отдельную SQL-таблицу, а имя таблицы берется из названия листа.
 
 Путь можно вставлять с русскими буквами:
 
@@ -107,7 +110,9 @@ SQL Server:
 
 - Первая строка CSV/XLSX считается строкой заголовков.
 - CSV с многострочными полями и лишними `;` в конце строк обрабатывается автоматически.
-- Для `.xlsx` читается первый лист `sheet1.xml`.
+- Для `.xlsx` читаются все листы. Пустые листы пропускаются.
+- Для `.xlsx` работает правило: один лист Excel = одна таблица SQL.
+- Название SQL-таблицы для XLSX берется из названия листа Excel и нормализуется: пробелы заменяются на `_`, небезопасные символы убираются.
 - Старый формат `.xls` не поддерживается. Его нужно сохранить как `.xlsx` или `.csv`.
 - Если таблица уже существует, используйте `--drop-existing`.
 - Для реальной загрузки нужен ODBC-драйвер выбранной СУБД.
