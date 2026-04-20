@@ -157,9 +157,14 @@ static bool promptYesNo(const std::string& label, bool defaultValue) {
 
 static std::string chooseInputFileDialog() {
     std::vector<wchar_t> fileName(32768, L'\0');
+    HWND owner = GetConsoleWindow();
+    if (owner) {
+        SetForegroundWindow(owner);
+    }
+
     OPENFILENAMEW ofn{};
     ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = nullptr;
+    ofn.hwndOwner = owner;
     ofn.lpstrFilter =
         L"CSV и Excel (*.csv;*.xlsx)\0*.csv;*.xlsx\0"
         L"CSV (*.csv)\0*.csv\0"
@@ -168,10 +173,20 @@ static std::string chooseInputFileDialog() {
     ofn.lpstrFile = fileName.data();
     ofn.nMaxFile = static_cast<DWORD>(fileName.size());
     ofn.lpstrTitle = L"Выберите CSV или XLSX файл для загрузки";
-    ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_HIDEREADONLY;
 
     if (!GetOpenFileNameW(&ofn)) return {};
     return wideToUtf8(fileName.data());
+}
+
+static void printFileDialogError() {
+    DWORD code = CommDlgExtendedError();
+    if (code == 0) {
+        std::cout << "Окно выбора файла было закрыто или не открылось. Можно вставить путь вручную.\n";
+    } else {
+        std::cout << "Не удалось открыть окно выбора файла. Код ошибки Windows: " << code << "\n";
+        std::cout << "Вставьте путь к файлу вручную.\n";
+    }
 }
 
 static std::string shellQuote(const std::string& s) {
@@ -883,7 +898,8 @@ static Options interactiveOptions() {
     while (true) {
         opt.input = chooseInputFileDialog();
         if (opt.input.empty()) {
-            opt.input = prompt("Файл не выбран. Вставьте путь к CSV/XLSX файлу вручную или нажмите Enter для повторного выбора");
+            printFileDialogError();
+            opt.input = prompt("Вставьте путь к CSV/XLSX файлу вручную или нажмите Enter для повторного выбора");
             if (opt.input.empty()) continue;
         }
         if (!fs::exists(makePath(opt.input))) {
