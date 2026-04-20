@@ -213,7 +213,7 @@ static void applyConfigFile(Options& opt, const fs::path& configPath) {
 }
 
 static bool promptYesNo(const std::string& label, bool defaultValue) {
-    std::string suffix = defaultValue ? "Д/н" : "д/Н";
+    std::string suffix = defaultValue ? "Y/n" : "y/N";
     while (true) {
         std::string answer = lower(trim(prompt(label + " (" + suffix + ")")));
         if (answer.empty()) return defaultValue;
@@ -223,13 +223,22 @@ static bool promptYesNo(const std::string& label, bool defaultValue) {
     }
 }
 
-static bool confirmTarget(const Options& opt) {
-    std::cout << "\nПроверьте параметры загрузки:\n";
+static void printServerSettings(const Options& opt) {
     std::cout << "  СУБД: " << opt.db << "\n";
+    if (!opt.connstr.empty()) {
+        std::cout << "  Подключение: задано через connstr\n";
+        return;
+    }
     std::cout << "  Хост: " << opt.host << "\n";
     std::cout << "  Порт: " << opt.port << "\n";
     std::cout << "  База данных: " << opt.dbname << "\n";
     std::cout << "  Пользователь: " << opt.user << "\n";
+    std::cout << "  Пароль: " << (opt.password.empty() ? "не задан" : "задан") << "\n";
+}
+
+static bool confirmTarget(const Options& opt) {
+    std::cout << "\nПроверьте параметры загрузки:\n";
+    printServerSettings(opt);
     std::cout << "  Файл: " << opt.input << "\n";
     if (!opt.table.empty()) std::cout << "  Таблица: " << opt.table << "\n";
     if (opt.db == "postgres" && opt.dbname == "postgres") {
@@ -936,46 +945,58 @@ static void printUsage() {
 static Options interactiveOptions() {
     Options opt;
     opt.interactive = true;
-    applyConfigFile(opt, defaultConfigPath());
+    fs::path configPath = defaultConfigPath();
+    bool hasConfig = fs::exists(configPath);
+    applyConfigFile(opt, configPath);
 
     std::cout << "Загрузчик SQL - интерфейс в терминале\n";
     std::cout << "Поддерживаемые файлы: .csv и .xlsx\n\n";
 
-    std::cout << "Сначала укажите данные SQL-сервера.\n";
-    std::cout << "\nТип базы данных:\n";
-    std::cout << "  1 - PostgreSQL\n";
-    std::cout << "  2 - MySQL\n";
-    std::cout << "  3 - SQL Server\n";
-    std::cout << "  4 - Своя строка подключения ODBC\n";
-    std::string dbChoice = trim(prompt("Выберите базу данных", "1"));
-    if (dbChoice == "2") opt.db = "mysql";
-    else if (dbChoice == "3") opt.db = "sqlserver";
-    else if (dbChoice == "4") {
-        opt.db = "custom";
-        opt.connstr = prompt("Строка подключения ODBC");
-    } else {
-        opt.db = "postgres";
+    bool editServer = true;
+    if (hasConfig) {
+        std::cout << "Найдены настройки SQL-сервера в config.ini:\n";
+        printServerSettings(opt);
+        editServer = !promptYesNo("Использовать эти настройки SQL-сервера", true);
     }
 
-    if (opt.connstr.empty()) {
-        if (opt.db == "postgres") {
-            opt.host = prompt("Хост", opt.host.empty() ? "localhost" : opt.host);
-            opt.port = prompt("Порт", opt.port.empty() ? "5432" : opt.port);
-            opt.dbname = prompt("Имя базы данных PostgreSQL, например sociology_survey", opt.dbname.empty() ? "sociology_survey" : opt.dbname);
-            opt.user = prompt("Пользователь", opt.user.empty() ? "postgres" : opt.user);
-            opt.password = prompt("Пароль", opt.password);
-        } else if (opt.db == "mysql") {
-            opt.host = prompt("Хост", opt.host.empty() ? "localhost" : opt.host);
-            opt.port = prompt("Порт", opt.port.empty() ? "3306" : opt.port);
-            opt.dbname = prompt("Имя базы данных", opt.dbname);
-            opt.user = prompt("Пользователь", opt.user.empty() ? "root" : opt.user);
-            opt.password = prompt("Пароль", opt.password);
-        } else if (opt.db == "sqlserver") {
-            opt.host = prompt("Хост", opt.host.empty() ? "localhost" : opt.host);
-            opt.port = prompt("Порт", opt.port.empty() ? "1433" : opt.port);
-            opt.dbname = prompt("Имя базы данных", opt.dbname);
-            opt.user = prompt("Пользователь", opt.user.empty() ? "sa" : opt.user);
-            opt.password = prompt("Пароль", opt.password);
+    if (editServer) {
+        std::cout << "Укажите данные SQL-сервера.\n";
+        std::cout << "\nТип базы данных:\n";
+        std::cout << "  1 - PostgreSQL\n";
+        std::cout << "  2 - MySQL\n";
+        std::cout << "  3 - SQL Server\n";
+        std::cout << "  4 - Своя строка подключения ODBC\n";
+        std::string dbChoice = trim(prompt("Выберите базу данных", "1"));
+        if (dbChoice == "2") opt.db = "mysql";
+        else if (dbChoice == "3") opt.db = "sqlserver";
+        else if (dbChoice == "4") {
+            opt.db = "custom";
+            opt.connstr = prompt("Строка подключения ODBC");
+        } else {
+            opt.db = "postgres";
+            opt.connstr.clear();
+        }
+
+        if (opt.connstr.empty()) {
+            if (opt.db == "postgres") {
+                opt.host = prompt("Хост", opt.host.empty() ? "localhost" : opt.host);
+                opt.port = prompt("Порт", opt.port.empty() ? "5432" : opt.port);
+                opt.dbname = prompt("Имя базы данных PostgreSQL, например sociology_survey", opt.dbname.empty() ? "sociology_survey" : opt.dbname);
+                opt.user = prompt("Пользователь", opt.user.empty() ? "postgres" : opt.user);
+                opt.password = prompt("Пароль", opt.password);
+            } else if (opt.db == "mysql") {
+                opt.host = prompt("Хост", opt.host.empty() ? "localhost" : opt.host);
+                opt.port = prompt("Порт", opt.port.empty() ? "3306" : opt.port);
+                opt.dbname = prompt("Имя базы данных", opt.dbname);
+                opt.user = prompt("Пользователь", opt.user.empty() ? "root" : opt.user);
+                opt.password = prompt("Пароль", opt.password);
+            } else if (opt.db == "sqlserver") {
+                opt.host = prompt("Хост", opt.host.empty() ? "localhost" : opt.host);
+                opt.port = prompt("Порт", opt.port.empty() ? "1433" : opt.port);
+                opt.dbname = prompt("Имя базы данных", opt.dbname);
+                opt.user = prompt("Пользователь", opt.user.empty() ? "sa" : opt.user);
+                opt.password = prompt("Пароль", opt.password);
+            }
         }
     }
 
