@@ -1,6 +1,7 @@
 *.exe
 *.dll
 *.log
+sample.csv
 *.o
 *.obj
 *.pdb
