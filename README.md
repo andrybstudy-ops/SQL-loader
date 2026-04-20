@@ -52,6 +52,46 @@ Copy-Item 'C:\Users\krepo\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.
 
 Для XLSX отдельное имя таблицы не спрашивается: каждый лист Excel загружается в отдельную SQL-таблицу, а имя таблицы берется из названия листа.
 
+## Запуск двойным кликом
+
+Можно запускать программу через файл:
+
+```text
+start_loader.bat
+```
+
+Он находится рядом с `sql_loader.exe`. Двойной клик по `start_loader.bat` откроет терминал и запустит программу.
+
+## Настройки подключения
+
+Программа умеет читать настройки из файла:
+
+```text
+config.ini
+```
+
+Он должен лежать рядом с `sql_loader.exe`.
+
+Пример:
+
+```ini
+[database]
+db=postgres
+host=localhost
+port=5432
+dbname=sociology_survey
+user=postgres
+password=YOUR_PASSWORD
+
+[load]
+dry_run=false
+drop_existing=true
+```
+
+Если `config.ini` есть, программа подставит эти значения как значения по умолчанию. Перед загрузкой она всё равно покажет параметры и попросит подтверждение.
+
+Файл `config.ini` добавлен в `.gitignore`, чтобы пароль не отправлялся в GitHub. В репозитории лежит только безопасный пример `config.example.ini`.
+
 Путь можно вставлять с русскими буквами:
 
 ```powershell

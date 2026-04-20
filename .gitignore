@@ -2,6 +2,7 @@
 *.dll
 *.log
 sample.csv
+config.ini
 *.o
 *.obj
 *.pdb

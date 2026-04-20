@@ -113,6 +113,16 @@ static std::string trim(const std::string& s) {
     return s.substr(start, end - start);
 }
 
+static std::string stripInlineComment(const std::string& s) {
+    bool inQuotes = false;
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (c == '"') inQuotes = !inQuotes;
+        if (!inQuotes && (c == '#' || c == ';')) return trim(s.substr(0, i));
+    }
+    return trim(s);
+}
+
 static std::string lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
@@ -123,6 +133,14 @@ static std::string lower(std::string s) {
 static bool endsWithLower(const std::string& s, const std::string& suffix) {
     std::string a = lower(s);
     return a.size() >= suffix.size() && a.substr(a.size() - suffix.size()) == suffix;
+}
+
+static bool parseBool(const std::string& value, bool defaultValue) {
+    std::string v = lower(trim(value));
+    if (v.empty()) return defaultValue;
+    if (v == "true" || v == "1" || v == "yes" || v == "y" || v == "да" || v == "д") return true;
+    if (v == "false" || v == "0" || v == "no" || v == "n" || v == "нет" || v == "н") return false;
+    return defaultValue;
 }
 
 static std::string stripOuterQuotes(std::string s) {
@@ -142,6 +160,56 @@ static std::string prompt(const std::string& label, const std::string& defaultVa
     value = stripOuterQuotes(value);
     if (value.empty()) return defaultValue;
     return value;
+}
+
+static fs::path executableDir() {
+    std::vector<wchar_t> buffer(32768, L'\0');
+    DWORD len = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (len == 0 || len >= buffer.size()) return fs::current_path();
+    return fs::path(std::wstring(buffer.data(), len)).parent_path();
+}
+
+static fs::path defaultConfigPath() {
+    fs::path besideExe = executableDir() / "config.ini";
+    if (fs::exists(besideExe)) return besideExe;
+    return fs::current_path() / "config.ini";
+}
+
+static void applyConfigFile(Options& opt, const fs::path& configPath) {
+    if (!fs::exists(configPath)) return;
+    std::ifstream in(configPath);
+    if (!in) throw std::runtime_error("Не удалось открыть config.ini: " + pathToUtf8(configPath));
+
+    std::string section;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        std::string value = stripInlineComment(line);
+        if (value.empty()) continue;
+        if (value.front() == '[' && value.back() == ']') {
+            section = lower(trim(value.substr(1, value.size() - 2)));
+            continue;
+        }
+        size_t eq = value.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = lower(trim(value.substr(0, eq)));
+        std::string val = stripOuterQuotes(trim(value.substr(eq + 1)));
+
+        if (section == "database") {
+            if (key == "db") opt.db = lower(val);
+            else if (key == "host") opt.host = val;
+            else if (key == "port") opt.port = val;
+            else if (key == "dbname") opt.dbname = val;
+            else if (key == "user") opt.user = val;
+            else if (key == "password") opt.password = val;
+            else if (key == "driver") opt.driver = val;
+            else if (key == "connstr") opt.connstr = val;
+        } else if (section == "load") {
+            if (key == "dry_run") opt.dryRun = parseBool(val, opt.dryRun);
+            else if (key == "drop_existing") opt.dropExisting = parseBool(val, opt.dropExisting);
+        }
+    }
+    logLine("ИНФО", "Настройки загружены из " + pathToUtf8(configPath));
 }
 
 static bool promptYesNo(const std::string& label, bool defaultValue) {
@@ -868,6 +936,7 @@ static void printUsage() {
 static Options interactiveOptions() {
     Options opt;
     opt.interactive = true;
+    applyConfigFile(opt, defaultConfigPath());
 
     std::cout << "Загрузчик SQL - интерфейс в терминале\n";
     std::cout << "Поддерживаемые файлы: .csv и .xlsx\n\n";
@@ -890,23 +959,23 @@ static Options interactiveOptions() {
 
     if (opt.connstr.empty()) {
         if (opt.db == "postgres") {
-            opt.host = prompt("Хост", "localhost");
-            opt.port = prompt("Порт", "5432");
-            opt.dbname = prompt("Имя базы данных PostgreSQL, например sociology_survey", "sociology_survey");
-            opt.user = prompt("Пользователь", "postgres");
-            opt.password = prompt("Пароль");
+            opt.host = prompt("Хост", opt.host.empty() ? "localhost" : opt.host);
+            opt.port = prompt("Порт", opt.port.empty() ? "5432" : opt.port);
+            opt.dbname = prompt("Имя базы данных PostgreSQL, например sociology_survey", opt.dbname.empty() ? "sociology_survey" : opt.dbname);
+            opt.user = prompt("Пользователь", opt.user.empty() ? "postgres" : opt.user);
+            opt.password = prompt("Пароль", opt.password);
         } else if (opt.db == "mysql") {
-            opt.host = prompt("Хост", "localhost");
-            opt.port = prompt("Порт", "3306");
-            opt.dbname = prompt("Имя базы данных");
-            opt.user = prompt("Пользователь", "root");
-            opt.password = prompt("Пароль");
+            opt.host = prompt("Хост", opt.host.empty() ? "localhost" : opt.host);
+            opt.port = prompt("Порт", opt.port.empty() ? "3306" : opt.port);
+            opt.dbname = prompt("Имя базы данных", opt.dbname);
+            opt.user = prompt("Пользователь", opt.user.empty() ? "root" : opt.user);
+            opt.password = prompt("Пароль", opt.password);
         } else if (opt.db == "sqlserver") {
-            opt.host = prompt("Хост", "localhost");
-            opt.port = prompt("Порт", "1433");
-            opt.dbname = prompt("Имя базы данных");
-            opt.user = prompt("Пользователь", "sa");
-            opt.password = prompt("Пароль");
+            opt.host = prompt("Хост", opt.host.empty() ? "localhost" : opt.host);
+            opt.port = prompt("Порт", opt.port.empty() ? "1433" : opt.port);
+            opt.dbname = prompt("Имя базы данных", opt.dbname);
+            opt.user = prompt("Пользователь", opt.user.empty() ? "sa" : opt.user);
+            opt.password = prompt("Пароль", opt.password);
         }
     }
 
@@ -954,6 +1023,7 @@ static Options interactiveOptions() {
 static Options parseArgs(const std::vector<std::string>& args) {
     Options opt;
     if (args.size() <= 1) return interactiveOptions();
+    applyConfigFile(opt, defaultConfigPath());
     for (size_t i = 1; i < args.size(); ++i) {
         std::string a = args[i];
         auto need = [&](const std::string& name) -> std::string {
