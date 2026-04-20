@@ -155,6 +155,22 @@ static bool promptYesNo(const std::string& label, bool defaultValue) {
     }
 }
 
+static bool confirmTarget(const Options& opt) {
+    std::cout << "\nПроверьте параметры загрузки:\n";
+    std::cout << "  СУБД: " << opt.db << "\n";
+    std::cout << "  Хост: " << opt.host << "\n";
+    std::cout << "  Порт: " << opt.port << "\n";
+    std::cout << "  База данных: " << opt.dbname << "\n";
+    std::cout << "  Пользователь: " << opt.user << "\n";
+    std::cout << "  Файл: " << opt.input << "\n";
+    if (!opt.table.empty()) std::cout << "  Таблица: " << opt.table << "\n";
+    if (opt.db == "postgres" && opt.dbname == "postgres") {
+        std::cout << "\nВнимание: выбрана системная база PostgreSQL с именем 'postgres'.\n";
+        std::cout << "Для проекта обычно нужна база 'sociology_survey'.\n";
+    }
+    return promptYesNo("Продолжить с этими параметрами", false);
+}
+
 static std::string chooseInputFileDialog() {
     std::vector<wchar_t> fileName(32768, L'\0');
     HWND owner = GetConsoleWindow();
@@ -876,7 +892,7 @@ static Options interactiveOptions() {
         if (opt.db == "postgres") {
             opt.host = prompt("Хост", "localhost");
             opt.port = prompt("Порт", "5432");
-            opt.dbname = prompt("Имя базы данных", "sociology_survey");
+            opt.dbname = prompt("Имя базы данных PostgreSQL, например sociology_survey", "sociology_survey");
             opt.user = prompt("Пользователь", "postgres");
             opt.password = prompt("Пароль");
         } else if (opt.db == "mysql") {
@@ -925,6 +941,10 @@ static Options interactiveOptions() {
     opt.dryRun = promptYesNo("Только проверить, без изменений в базе", true);
     if (!opt.dryRun) {
         opt.dropExisting = promptYesNo("Удалить существующую таблицу с таким же именем перед загрузкой", false);
+    }
+
+    if (!confirmTarget(opt)) {
+        throw std::runtime_error("Загрузка отменена пользователем");
     }
 
     std::cout << "\n";
