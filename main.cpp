@@ -484,6 +484,34 @@ static std::vector<std::string> normalizeColumns(const std::vector<std::string>&
     return result;
 }
 
+static bool isIdColumnName(const std::string& name) {
+    std::string normalized = trim(name);
+    std::string asciiLower = lower(normalized);
+    return asciiLower == "id" ||
+           normalized == "Номер" ||
+           normalized == "номер" ||
+           normalized == "НОМЕР";
+}
+
+static void ensureIdColumn(TableData& data) {
+    for (const auto& column : data.columns) {
+        if (isIdColumnName(column)) return;
+    }
+
+    std::string idName = "id";
+    std::map<std::string, int> seen;
+    for (const auto& column : data.columns) seen[lower(column)]++;
+    int suffix = 2;
+    while (seen[lower(idName)] > 0) {
+        idName = "id_" + std::to_string(suffix++);
+    }
+
+    data.columns.insert(data.columns.begin(), idName);
+    for (size_t i = 0; i < data.rows.size(); ++i) {
+        data.rows[i].insert(data.rows[i].begin(), std::to_string(i + 1));
+    }
+}
+
 static std::vector<std::string> parseCsvLine(const std::string& line, char delimiter) {
     std::vector<std::string> fields;
     std::string field;
@@ -626,6 +654,7 @@ static TableData readCsv(const fs::path& path) {
         if (any) data.rows.push_back(row);
     }
 
+    ensureIdColumn(data);
     logLine("ИНФО", "Разделитель CSV: " + std::string(delimiter == '\t' ? "\\t" : std::string(1, delimiter)));
     return data;
 }
@@ -749,6 +778,7 @@ static TableData parseXlsxSheet(const fs::path& sheetPath, const std::vector<std
         rawRows[i].resize(data.columns.size());
         data.rows.push_back(rawRows[i]);
     }
+    ensureIdColumn(data);
     return data;
 }
 
