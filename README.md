@@ -44,10 +44,10 @@ Copy-Item 'C:\Users\krepo\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.
 
 Если рядом лежит `config.ini`, программа:
 
-- покажет настройки SQL-сервера из `config.ini`;
-- спросит `Использовать эти настройки SQL-сервера (Y/n)`;
-- при ответе `Y` сразу перейдет к выбору файла;
-- при ответе `n` позволит вручную изменить параметры подключения;
+- покажет список сохранённых серверов из `config.ini`;
+- позволит выбрать готовый сервер по номеру;
+- позволит добавить новый сервер через пункт `A`;
+- позволит вручную ввести сервер через пункт `M`;
 - откроет окно выбора `.csv` или `.xlsx`;
 - спросит имя таблицы для CSV;
 - спросит, выполнить только проверку или сразу загрузить данные.
@@ -93,6 +93,49 @@ drop_existing=true
 Если `config.ini` есть, программа больше не заставляет вводить сервер каждый раз. Она покажет настройки и спросит подтверждение в формате `(Y/n)` или `(y/N)`. Перед загрузкой программа ещё раз покажет итоговые параметры: сервер, базу, пользователя и файл.
 
 Файл `config.ini` добавлен в `.gitignore`, чтобы пароль не отправлялся в GitHub. В репозитории лежит только безопасный пример `config.example.ini`.
+
+## Несколько серверов
+
+В `config.ini` можно хранить несколько серверов:
+
+```ini
+[database]
+db=postgres
+host=localhost
+port=5432
+dbname=sociology_survey
+user=postgres
+password=YOUR_PASSWORD
+
+[server.local_postgres]
+db=postgres
+host=localhost
+port=5432
+dbname=sociology_survey
+user=postgres
+password=YOUR_PASSWORD
+
+[server.test_postgres]
+db=postgres
+host=localhost
+port=5432
+dbname=postgres
+user=postgres
+password=YOUR_PASSWORD
+```
+
+При запуске программа покажет меню:
+
+```text
+Доступные серверы из config.ini:
+  1 - Основной (...)
+  2 - local_postgres (...)
+  3 - test_postgres (...)
+  A - добавить новый сервер
+  M - ввести сервер вручную
+```
+
+Если выбрать `A`, программа спросит параметры подключения и сохранит новый сервер в `config.ini`.
 
 Путь можно вставлять с русскими буквами:
 

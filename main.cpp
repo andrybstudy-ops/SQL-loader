@@ -81,6 +81,11 @@ struct Options {
     bool interactive = false;
 };
 
+struct ServerProfile {
+    std::string name;
+    Options options;
+};
+
 struct TableData {
     std::vector<std::string> columns;
     std::vector<std::vector<std::string>> rows;
@@ -175,6 +180,17 @@ static fs::path defaultConfigPath() {
     return fs::current_path() / "config.ini";
 }
 
+static void applyDatabaseSetting(Options& opt, const std::string& key, const std::string& val) {
+    if (key == "db") opt.db = lower(val);
+    else if (key == "host") opt.host = val;
+    else if (key == "port") opt.port = val;
+    else if (key == "dbname") opt.dbname = val;
+    else if (key == "user") opt.user = val;
+    else if (key == "password") opt.password = val;
+    else if (key == "driver") opt.driver = val;
+    else if (key == "connstr") opt.connstr = val;
+}
+
 static void applyConfigFile(Options& opt, const fs::path& configPath) {
     if (!fs::exists(configPath)) return;
     std::ifstream in(configPath);
@@ -196,20 +212,86 @@ static void applyConfigFile(Options& opt, const fs::path& configPath) {
         std::string val = stripOuterQuotes(trim(value.substr(eq + 1)));
 
         if (section == "database") {
-            if (key == "db") opt.db = lower(val);
-            else if (key == "host") opt.host = val;
-            else if (key == "port") opt.port = val;
-            else if (key == "dbname") opt.dbname = val;
-            else if (key == "user") opt.user = val;
-            else if (key == "password") opt.password = val;
-            else if (key == "driver") opt.driver = val;
-            else if (key == "connstr") opt.connstr = val;
+            applyDatabaseSetting(opt, key, val);
         } else if (section == "load") {
             if (key == "dry_run") opt.dryRun = parseBool(val, opt.dryRun);
             else if (key == "drop_existing") opt.dropExisting = parseBool(val, opt.dropExisting);
         }
     }
     logLine("ИНФО", "Настройки загружены из " + pathToUtf8(configPath));
+}
+
+static std::vector<ServerProfile> loadServerProfiles(const fs::path& configPath) {
+    std::vector<ServerProfile> profiles;
+    if (!fs::exists(configPath)) return profiles;
+
+    std::ifstream in(configPath);
+    if (!in) throw std::runtime_error("Не удалось открыть config.ini: " + pathToUtf8(configPath));
+
+    ServerProfile current;
+    bool inProfile = false;
+    std::string section;
+    std::string line;
+
+    auto flush = [&]() {
+        if (inProfile && !current.name.empty()) profiles.push_back(current);
+        current = {};
+        inProfile = false;
+    };
+
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        std::string value = stripInlineComment(line);
+        if (value.empty()) continue;
+
+        if (value.front() == '[' && value.back() == ']') {
+            flush();
+            section = trim(value.substr(1, value.size() - 2));
+            std::string sectionLower = lower(section);
+            if (sectionLower == "database") {
+                current = {"Основной", Options{}};
+                inProfile = true;
+            } else if (sectionLower.rfind("server.", 0) == 0) {
+                current = {section.substr(7), Options{}};
+                inProfile = true;
+            }
+            continue;
+        }
+
+        if (!inProfile) continue;
+        size_t eq = value.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = lower(trim(value.substr(0, eq)));
+        std::string val = stripOuterQuotes(trim(value.substr(eq + 1)));
+        applyDatabaseSetting(current.options, key, val);
+    }
+    flush();
+    return profiles;
+}
+
+static void appendServerProfile(const fs::path& configPath, const std::string& profileName, const Options& opt) {
+    std::ofstream out(configPath, std::ios::app);
+    if (!out) throw std::runtime_error("Не удалось записать config.ini: " + pathToUtf8(configPath));
+
+    std::string sectionName;
+    for (unsigned char c : profileName) {
+        if (std::isalnum(c)) sectionName += static_cast<char>(std::tolower(c));
+        else if (sectionName.empty() || sectionName.back() != '_') sectionName += '_';
+    }
+    while (!sectionName.empty() && sectionName.back() == '_') sectionName.pop_back();
+    if (sectionName.empty()) sectionName = "server";
+    out << "\n[server." << sectionName << "]\n";
+    out << "db=" << opt.db << "\n";
+    if (!opt.connstr.empty()) {
+        out << "connstr=" << opt.connstr << "\n";
+    } else {
+        out << "host=" << opt.host << "\n";
+        out << "port=" << opt.port << "\n";
+        out << "dbname=" << opt.dbname << "\n";
+        out << "user=" << opt.user << "\n";
+        out << "password=" << opt.password << "\n";
+        if (!opt.driver.empty()) out << "driver=" << opt.driver << "\n";
+    }
 }
 
 static bool promptYesNo(const std::string& label, bool defaultValue) {
@@ -246,6 +328,51 @@ static bool confirmTarget(const Options& opt) {
         std::cout << "Для проекта обычно нужна база 'sociology_survey'.\n";
     }
     return promptYesNo("Продолжить с этими параметрами", false);
+}
+
+static Options promptServerSettings(Options opt) {
+    std::cout << "\nТип базы данных:\n";
+    std::cout << "  1 - PostgreSQL\n";
+    std::cout << "  2 - MySQL\n";
+    std::cout << "  3 - SQL Server\n";
+    std::cout << "  4 - Своя строка подключения ODBC\n";
+    std::string defaultChoice = opt.db == "mysql" ? "2" : (opt.db == "sqlserver" ? "3" : (!opt.connstr.empty() ? "4" : "1"));
+    std::string dbChoice = trim(prompt("Выберите базу данных", defaultChoice));
+    if (dbChoice == "2") {
+        opt.db = "mysql";
+        opt.connstr.clear();
+    } else if (dbChoice == "3") {
+        opt.db = "sqlserver";
+        opt.connstr.clear();
+    } else if (dbChoice == "4") {
+        opt.db = "custom";
+        opt.connstr = prompt("Строка подключения ODBC", opt.connstr);
+        return opt;
+    } else {
+        opt.db = "postgres";
+        opt.connstr.clear();
+    }
+
+    if (opt.db == "postgres") {
+        opt.host = prompt("Хост", opt.host.empty() ? "localhost" : opt.host);
+        opt.port = prompt("Порт", opt.port.empty() ? "5432" : opt.port);
+        opt.dbname = prompt("Имя базы данных PostgreSQL, например sociology_survey", opt.dbname.empty() ? "sociology_survey" : opt.dbname);
+        opt.user = prompt("Пользователь", opt.user.empty() ? "postgres" : opt.user);
+        opt.password = prompt("Пароль", opt.password);
+    } else if (opt.db == "mysql") {
+        opt.host = prompt("Хост", opt.host.empty() ? "localhost" : opt.host);
+        opt.port = prompt("Порт", opt.port.empty() ? "3306" : opt.port);
+        opt.dbname = prompt("Имя базы данных", opt.dbname);
+        opt.user = prompt("Пользователь", opt.user.empty() ? "root" : opt.user);
+        opt.password = prompt("Пароль", opt.password);
+    } else if (opt.db == "sqlserver") {
+        opt.host = prompt("Хост", opt.host.empty() ? "localhost" : opt.host);
+        opt.port = prompt("Порт", opt.port.empty() ? "1433" : opt.port);
+        opt.dbname = prompt("Имя базы данных", opt.dbname);
+        opt.user = prompt("Пользователь", opt.user.empty() ? "sa" : opt.user);
+        opt.password = prompt("Пароль", opt.password);
+    }
+    return opt;
 }
 
 static std::string chooseInputFileDialog() {
@@ -954,49 +1081,48 @@ static Options interactiveOptions() {
 
     bool editServer = true;
     if (hasConfig) {
-        std::cout << "Найдены настройки SQL-сервера в config.ini:\n";
-        printServerSettings(opt);
-        editServer = !promptYesNo("Использовать эти настройки SQL-сервера", true);
+        auto profiles = loadServerProfiles(configPath);
+        if (!profiles.empty()) {
+            std::cout << "Доступные серверы из config.ini:\n";
+            for (size_t i = 0; i < profiles.size(); ++i) {
+                std::cout << "  " << (i + 1) << " - " << profiles[i].name
+                          << " (" << profiles[i].options.db << ", "
+                          << profiles[i].options.host << ":" << profiles[i].options.port
+                          << ", " << profiles[i].options.dbname << ")\n";
+            }
+            std::cout << "  A - добавить новый сервер\n";
+            std::cout << "  M - ввести сервер вручную\n";
+            std::string choice = trim(prompt("Выберите сервер", "1"));
+            std::string choiceLower = lower(choice);
+            if (choiceLower == "a") {
+                opt = promptServerSettings(opt);
+                std::string profileName = prompt("Название нового сервера", opt.dbname.empty() ? "server" : opt.dbname);
+                appendServerProfile(configPath, profileName, opt);
+                std::cout << "Сервер сохранён в config.ini как '" << profileName << "'.\n";
+                editServer = false;
+            } else if (choiceLower == "m") {
+                editServer = true;
+            } else {
+                int index = std::atoi(choice.c_str());
+                if (index >= 1 && static_cast<size_t>(index) <= profiles.size()) {
+                    opt = profiles[static_cast<size_t>(index - 1)].options;
+                    editServer = false;
+                }
+            }
+        } else {
+            std::cout << "Найдены настройки SQL-сервера в config.ini:\n";
+            printServerSettings(opt);
+            editServer = !promptYesNo("Использовать эти настройки SQL-сервера", true);
+        }
     }
 
     if (editServer) {
         std::cout << "Укажите данные SQL-сервера.\n";
-        std::cout << "\nТип базы данных:\n";
-        std::cout << "  1 - PostgreSQL\n";
-        std::cout << "  2 - MySQL\n";
-        std::cout << "  3 - SQL Server\n";
-        std::cout << "  4 - Своя строка подключения ODBC\n";
-        std::string dbChoice = trim(prompt("Выберите базу данных", "1"));
-        if (dbChoice == "2") opt.db = "mysql";
-        else if (dbChoice == "3") opt.db = "sqlserver";
-        else if (dbChoice == "4") {
-            opt.db = "custom";
-            opt.connstr = prompt("Строка подключения ODBC");
-        } else {
-            opt.db = "postgres";
-            opt.connstr.clear();
-        }
-
-        if (opt.connstr.empty()) {
-            if (opt.db == "postgres") {
-                opt.host = prompt("Хост", opt.host.empty() ? "localhost" : opt.host);
-                opt.port = prompt("Порт", opt.port.empty() ? "5432" : opt.port);
-                opt.dbname = prompt("Имя базы данных PostgreSQL, например sociology_survey", opt.dbname.empty() ? "sociology_survey" : opt.dbname);
-                opt.user = prompt("Пользователь", opt.user.empty() ? "postgres" : opt.user);
-                opt.password = prompt("Пароль", opt.password);
-            } else if (opt.db == "mysql") {
-                opt.host = prompt("Хост", opt.host.empty() ? "localhost" : opt.host);
-                opt.port = prompt("Порт", opt.port.empty() ? "3306" : opt.port);
-                opt.dbname = prompt("Имя базы данных", opt.dbname);
-                opt.user = prompt("Пользователь", opt.user.empty() ? "root" : opt.user);
-                opt.password = prompt("Пароль", opt.password);
-            } else if (opt.db == "sqlserver") {
-                opt.host = prompt("Хост", opt.host.empty() ? "localhost" : opt.host);
-                opt.port = prompt("Порт", opt.port.empty() ? "1433" : opt.port);
-                opt.dbname = prompt("Имя базы данных", opt.dbname);
-                opt.user = prompt("Пользователь", opt.user.empty() ? "sa" : opt.user);
-                opt.password = prompt("Пароль", opt.password);
-            }
+        opt = promptServerSettings(opt);
+        if (promptYesNo("Сохранить этот сервер в config.ini для быстрого выбора", true)) {
+            std::string profileName = prompt("Название сервера", opt.dbname.empty() ? "server" : opt.dbname);
+            appendServerProfile(configPath, profileName, opt);
+            std::cout << "Сервер сохранён в config.ini как '" << profileName << "'.\n";
         }
     }
 
